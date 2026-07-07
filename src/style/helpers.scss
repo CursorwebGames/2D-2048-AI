@@ -1,3 +1,5 @@
+@use "sass:math";
+
 // Exponent
 // From: https://github.com/Team-Sass/Sassy-math/blob/master/sass/math.scss#L36
 
@@ -11,7 +13,7 @@
   // negitive intergers get divided. A number divided by itself is 1
   @if $exponent < 1 {
     @for $i from 0 through -$exponent {
-      $value: $value / $base; } }
+      $value: math.div($value, $base); } }
   // return the last value written
   @return $value;
 }
@@ -54,13 +56,13 @@
 
 // Keyframe animations
 @mixin keyframes($animation-name) {
-  @-webkit-keyframes $animation-name {
+  @-webkit-keyframes #{$animation-name} {
     @content;
   }
-  @-moz-keyframes $animation-name {
+  @-moz-keyframes #{$animation-name} {
     @content;
   }
-  @keyframes $animation-name {
+  @keyframes #{$animation-name} {
     @content;
   }
 }
