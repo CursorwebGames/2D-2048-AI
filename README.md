@@ -7,6 +7,8 @@ Research to find the best 2048 AI.
 * Race against the AI
 * Big 2048 boards
 * Seed boards
+* 2048 Hard: always put the worst number at the worst place
+* Big 2048
 
 ## Models
 * CSS Model (top right bottom left)
