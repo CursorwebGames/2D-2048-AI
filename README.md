@@ -18,3 +18,7 @@ Research to find the best 2048 AI.
 
 ## Credit
 Forked from the [🐐 GOAT](https://github.com/gabrielecirulli/2048/tree/master)
+
+## Sources
+https://docs.pytorch.org/tutorials/intermediate/reinforcement_q_learning.html
+https://www.ibm.com/think/topics/reinforcement-learning
