@@ -14,6 +14,9 @@ Research to find the best 2048 AI.
 * CSS Model (top right bottom left)
 * Random
 * Reinforcement Learning
+    * DQN
+    * TD
+    * CNN DQN?
 * Logical (https://stackoverflow.com/questions/22342854/what-is-the-optimal-algorithm-for-the-game-2048/23853848#23853848)
 
 ## Credit

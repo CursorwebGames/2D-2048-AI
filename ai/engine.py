@@ -20,15 +20,16 @@ class Engine:
         self.reset()
 
     def reset(self) -> np.ndarray:
+        """Shape (16,)"""
         self.board = np.zeros((self.size, self.size), dtype=np.int64)
         self.score = 0
         self.done = False
         self.spawn_tile()
         self.spawn_tile()
-        return self.board.copy()
+        return self.board.copy().flatten()
 
-    def step(self, action: int):
-        """Apply an action. Returns (board, reward, done, info)."""
+    def step(self, action: int) -> tuple[np.ndarray, int, bool, dict]:
+        """Apply an action. Returns (board = (16,), reward, done, info ={'score':int, 'moved':bool})."""
         if self.done:
             raise RuntimeError("game is over, call reset()")
 
@@ -39,7 +40,7 @@ class Engine:
 
         self.done = not self.has_moves()
         info = {"score": self.score, "moved": moved}
-        return self.board.copy(), reward, self.done, info
+        return self.board.copy().flatten(), reward, self.done, info
 
     def legal_actions(self) -> list[int]:
         return [a for a in Action if self.move(a, dry_run=True)[0]]
