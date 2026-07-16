@@ -78,7 +78,7 @@ Q(s, a) = E[r0 + gamma*r1 + gamma^2*r2 + ...]
 EPS_START = 0.9
 """ Epsilon, whether to explore or to exploit """
 EPS_END = 0.01
-EPS_DECAY = 2500
+EPS_DECAY = 300
 """ Rate of exponential decay of epsilon, higher = slower decay """
 TAU = 0.005
 """ Update rate (changes teacher, the equation) """
@@ -108,7 +108,7 @@ start_episode = 0
 CHECKPOINT_PATH = "checkpoint_2048.pth"
 
 if os.path.exists(CHECKPOINT_PATH):
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
     policy_net.load_state_dict(checkpoint["policy_net"])
     target_net.load_state_dict(checkpoint["target_net"])
     optimizer.load_state_dict(checkpoint["optimizer"])
@@ -118,15 +118,16 @@ if os.path.exists(CHECKPOINT_PATH):
     print(f"resumed from {CHECKPOINT_PATH} at episode {start_episode}")
 
 
-def select_action(state):
+def select_action(state, i_episode):
     """Returns [[int]] shape [1, 1]"""
     global steps_done
 
     # Generate a random float between 0 and 1
     sample = random.random()
 
-    # epsilon threshold
-    epsilon = EPS_END + (EPS_START - EPS_END) * math.exp(-1.0 * steps_done / EPS_DECAY)
+    # epsilon threshold, decayed per episode (not per step) so exploration
+    # pacing is predictable regardless of how long episodes run
+    epsilon = EPS_END + (EPS_START - EPS_END) * math.exp(-1.0 * i_episode / EPS_DECAY)
 
     steps_done += 1
 
@@ -203,14 +204,17 @@ def optimize_model():
     # connected to policy_net params btw
     state_action_values = policy_net(state_batch).gather(1, action_batch)
 
-    # Compute V(s_t+1) = max_a Q(s_t+1, a) for all next states.
-    # Estimated value of next state, (for teaching)
+    # Compute V(s_t+1) for all next states, Double DQN style: policy_net
+    # picks the best action (argmax), target_net evaluates it. Using the
+    # same network for both (plain DQN) systematically overestimates Q,
+    # since argmax tends to latch onto whichever action has noisy/inflated
+    # value at that moment, and that same inflated value becomes the target.
+    # Splitting the pick/evaluate roles across two networks cancels that bias.
     next_state_values = torch.zeros(BATCH_SIZE, device=device)
     with torch.no_grad():
-        # Use target to find V(s_t+1) for non-terminal states
-        # similar to select_action
+        best_actions = policy_net(non_final_next_states).argmax(1, keepdim=True)
         next_state_values[non_final_mask] = (
-            target_net(non_final_next_states).max(1).values
+            target_net(non_final_next_states).gather(1, best_actions).squeeze(1)
         )
     # Compute the Bellman target, Q(s, a) = r + gamma * max Q(s', a')
     expected_state_action_values = (next_state_values * GAMMA) + reward_batch
@@ -238,6 +242,12 @@ else:
 
 
 def save_checkpoint(episode):
+    # Write to a temp file first, then atomically rename over the real
+    # checkpoint. If the process dies mid-write (crash, Ctrl+C), the temp
+    # file is left corrupted but CHECKPOINT_PATH itself is never touched
+    # until the write has fully succeeded, so it's always either fully
+    # old or fully new, never truncated/corrupted.
+    tmp_path = CHECKPOINT_PATH + ".tmp"
     torch.save(
         {
             "policy_net": policy_net.state_dict(),
@@ -247,8 +257,9 @@ def save_checkpoint(episode):
             "episode_scores": episode_scores,
             "episode": episode,
         },
-        CHECKPOINT_PATH,
+        tmp_path,
     )
+    os.replace(tmp_path, CHECKPOINT_PATH)
 
 
 start_time = time.time()
@@ -266,8 +277,8 @@ try:
         state = env.reset()
         state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
         for t in count():  # infinite counter
-            action = select_action(state)
-            board, reward, done, info = env.step(int(action.item()))
+            action = select_action(state, i_episode)
+            board, reward, done, score = env.step(int(action.item()))
             reward = torch.tensor([reward], device=device)
 
             if done:
@@ -288,7 +299,7 @@ try:
 
             # Soft update of the target=teacher network's weights each step
             # closer to policy
-            # θ′ ← τ θ + (1 −τ )θ′
+            # θ′ ← τ θ + (1 − τ)θ′
             target_net_state_dict = target_net.state_dict()
             policy_net_state_dict = policy_net.state_dict()
             for key in policy_net_state_dict:
@@ -298,14 +309,14 @@ try:
             target_net.load_state_dict(target_net_state_dict)
 
             if done:
-                episode_scores.append(info["score"])
+                episode_scores.append(score)
                 epsilon = EPS_END + (EPS_START - EPS_END) * math.exp(
-                    -1.0 * steps_done / EPS_DECAY
+                    -1.0 * i_episode / EPS_DECAY
                 )
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 tqdm.write(
                     f"[{timestamp}] episode {i_episode + 1}/{num_episodes} "
-                    f"score={info['score']} steps={t + 1} epsilon={epsilon:.3f}"
+                    f"score={score} steps={t + 1} epsilon={epsilon:.3f}"
                 )
                 break
 

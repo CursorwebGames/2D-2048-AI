@@ -1,4 +1,6 @@
+import argparse
 import os
+import random
 
 try:
     import msvcrt
@@ -10,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from engine import Action, Engine
+from random_agent import benchmark, print_stats
 
 CHECKPOINT_PATH = "checkpoint_2048.pth"
 
@@ -112,6 +115,64 @@ def select_action(policy_net, state, legal_actions):
     return int(masked.argmax().item())
 
 
+def dqn_play_episode(policy_net, env: Engine, device) -> int:
+    env.reset()
+    while not env.done:
+        state = torch.tensor(
+            env.board.flatten(), dtype=torch.float32, device=device
+        ).unsqueeze(0)
+        action = select_action(policy_net, state, env.legal_actions())
+        env.step(action)
+    return env.score
+
+
+def run_benchmark(policy_net, device, num_episodes: int):
+    env = Engine()
+    dqn_scores = [
+        dqn_play_episode(policy_net, env, device) for _ in range(num_episodes)
+    ]
+    random_scores = benchmark(num_episodes)
+
+    print_stats(dqn_scores, label="dqn")
+    print_stats(random_scores, label="random")
+
+    dqn_mean = sum(dqn_scores) / len(dqn_scores)
+    random_mean = sum(random_scores) / len(random_scores)
+    verdict = "better than" if dqn_mean > random_mean else "not better than"
+    print(f"\ndqn is {verdict} random ({dqn_mean:.1f} vs {random_mean:.1f})")
+
+
+def reward_sanity_check(num_episodes: int):
+    """Play random-agent episodes and report the resulting reward/score
+    distribution, so reward-shaping changes in engine.py can be sanity
+    checked without needing a trained policy.
+
+    Goals: reward exponentially 1024 and 1024 merge is very very good
+
+    """
+    env = Engine()
+    rewards = []
+    final_scores = []
+    for _ in range(num_episodes):
+        env.reset()
+        while not env.done:
+            legal = env.legal_actions()
+            action = random.choice(legal) if legal else 0
+            _, reward, _, _ = env.step(action)
+            rewards.append(reward)
+        final_scores.append(env.score)
+
+    print(f"ran {num_episodes} random-agent episodes\n")
+    print(
+        f"final score: min={min(final_scores)}  max={max(final_scores)}  "
+        f"avg={sum(final_scores) / len(final_scores):.1f}"
+    )
+    print(
+        f"reward:      min={min(rewards)}  max={max(rewards)}  "
+        f"avg={sum(rewards) / len(rewards):.2f}"
+    )
+
+
 def draw(frame, is_history: bool, is_done: bool):
     os.system("cls" if os.name == "nt" else "clear")
     move = f"  move={frame['action'].name}" if frame["action"] is not None else ""
@@ -128,6 +189,27 @@ def draw(frame, is_history: bool, is_done: bool):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--benchmark",
+        type=int,
+        default=0,
+        metavar="N",
+        help="run N episodes headlessly and compare dqn vs random, instead of the interactive viewer",
+    )
+    parser.add_argument(
+        "--reward-check",
+        type=int,
+        default=0,
+        metavar="N",
+        help="run N random-agent episodes and report reward/score stats (no checkpoint needed)",
+    )
+    args = parser.parse_args()
+
+    if args.reward_check:
+        reward_sanity_check(args.reward_check)
+        return
+
     device = torch.device("cpu")
     policy_net = DQN(n_observations, n_actions).to(device)
 
@@ -136,10 +218,22 @@ def main():
     policy_net.eval()
     print(f"loaded {CHECKPOINT_PATH} (trained through episode {checkpoint['episode']})")
 
+    if args.benchmark:
+        run_benchmark(policy_net, device, args.benchmark)
+        return
+
     env = Engine()
     env.reset()
 
-    history = [{"board": env.board.copy(), "score": 0, "step": 0, "action": None, "reward": None}]
+    history = [
+        {
+            "board": env.board.copy(),
+            "score": 0,
+            "step": 0,
+            "action": None,
+            "reward": None,
+        }
+    ]
     idx = 0
 
     draw(history[idx], is_history=False, is_done=False)
@@ -160,11 +254,11 @@ def main():
                     env.board.flatten(), dtype=torch.float32, device=device
                 ).unsqueeze(0)
                 action = select_action(policy_net, state, legal_actions)
-                _, reward, _, info = env.step(action)
+                _, reward, _, score = env.step(action)
                 history.append(
                     {
                         "board": env.board.copy(),
-                        "score": info["score"],
+                        "score": score,
                         "step": len(history),
                         "action": Action(action),
                         "reward": reward,
@@ -172,7 +266,11 @@ def main():
                 )
                 idx += 1
 
-        draw(history[idx], is_history=idx < len(history) - 1, is_done=env.done and idx == len(history) - 1)
+        draw(
+            history[idx],
+            is_history=idx < len(history) - 1,
+            is_done=env.done and idx == len(history) - 1,
+        )
 
     print(f"\nfinal score={env.score}")
 
