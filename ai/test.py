@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from engine import Action, Engine
+from engine import Action, Engine, WIN_EXPONENT
 from random_agent import benchmark, print_stats
 
 CHECKPOINT_PATH = "checkpoint_2048.pth"
@@ -118,10 +118,29 @@ def select_action(policy_net, state, legal_actions):
 def dqn_play_episode(policy_net, env: Engine, device) -> int:
     env.reset()
     while not env.done:
-        state = torch.tensor(
-            env.board.flatten(), dtype=torch.float32, device=device
-        ).unsqueeze(0)
+        # same [0, 1] input scaling as training (train.py divides by
+        # WIN_EXPONENT) -- the net only ever saw scaled inputs
+        state = (
+            torch.tensor(
+                env.board.flatten(), dtype=torch.float32, device=device
+            ).unsqueeze(0)
+            / WIN_EXPONENT
+        )
         action = select_action(policy_net, state, env.legal_actions())
+        env.step(action)
+    return env.score
+
+
+def greedy_play_episode(env: Engine) -> int:
+    """Plays whichever move has the best immediate shaped reward -- the
+    reward function acting as a one-step policy, no learning and no
+    lookahead. This is the bar the DQN has to clear: its only advantage
+    over this baseline is learned multi-step value (lookahead via
+    bootstrapped Q-values)."""
+    env.reset()
+    while not env.done:
+        legal = env.legal_actions()
+        action = max(legal, key=lambda a: env.evaluate_action(a))
         env.step(action)
     return env.score
 
@@ -131,15 +150,23 @@ def run_benchmark(policy_net, device, num_episodes: int):
     dqn_scores = [
         dqn_play_episode(policy_net, env, device) for _ in range(num_episodes)
     ]
+    greedy_scores = [greedy_play_episode(env) for _ in range(num_episodes)]
     random_scores = benchmark(num_episodes)
 
     print_stats(dqn_scores, label="dqn")
+    print_stats(greedy_scores, label="greedy")
     print_stats(random_scores, label="random")
 
     dqn_mean = sum(dqn_scores) / len(dqn_scores)
+    greedy_mean = sum(greedy_scores) / len(greedy_scores)
     random_mean = sum(random_scores) / len(random_scores)
-    verdict = "better than" if dqn_mean > random_mean else "not better than"
-    print(f"\ndqn is {verdict} random ({dqn_mean:.1f} vs {random_mean:.1f})")
+    print(
+        f"\ndqn={dqn_mean:.1f}  greedy={greedy_mean:.1f}  random={random_mean:.1f}"
+    )
+    if dqn_mean > greedy_mean:
+        print("dqn beats greedy: the net has learned lookahead beyond the reward function")
+    else:
+        print("dqn does NOT beat greedy: the net hasn't learned more than the reward function already says")
 
 
 def reward_sanity_check(num_episodes: int):
@@ -250,9 +277,13 @@ def main():
                 idx += 1
             elif not env.done:
                 legal_actions = env.legal_actions()
-                state = torch.tensor(
-                    env.board.flatten(), dtype=torch.float32, device=device
-                ).unsqueeze(0)
+                # same [0, 1] input scaling as training
+                state = (
+                    torch.tensor(
+                        env.board.flatten(), dtype=torch.float32, device=device
+                    ).unsqueeze(0)
+                    / WIN_EXPONENT
+                )
                 action = select_action(policy_net, state, legal_actions)
                 _, reward, _, score = env.step(action)
                 history.append(

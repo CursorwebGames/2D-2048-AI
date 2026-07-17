@@ -4,6 +4,8 @@ interface InputEvents {
     move: Direction;
     restart: void;
     keepPlaying: void;
+    undo: void;
+    redo: void;
 }
 
 type EventCallback<K extends keyof InputEvents> = (data: InputEvents[K]) => void;
@@ -60,6 +62,15 @@ export class KeyboardInputManager {
                 // R key restarts the game
                 if (event.code === "KeyR") {
                     this.restart(event);
+                }
+
+                // Backspace undoes the last move, Enter redoes it
+                if (event.code === "Backspace") {
+                    event.preventDefault();
+                    this.emit("undo", undefined);
+                } else if (event.code === "Enter") {
+                    event.preventDefault();
+                    this.emit("redo", undefined);
                 }
             }
         });

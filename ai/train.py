@@ -1,6 +1,7 @@
 import math
 import os
 import random
+import signal
 import time
 import matplotlib
 import matplotlib.pyplot as plt
@@ -14,7 +15,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-from engine import Engine
+from engine import Engine, WIN_EXPONENT
 
 plt.ion()
 
@@ -118,8 +119,15 @@ if os.path.exists(CHECKPOINT_PATH):
     print(f"resumed from {CHECKPOINT_PATH} at episode {start_episode}")
 
 
-def select_action(state, i_episode):
-    """Returns [[int]] shape [1, 1]"""
+def select_action(state, i_episode, legal_actions):
+    """Returns [[int]] shape [1, 1], always a legal action.
+
+    Masking illegal actions here (like test.py already does) means:
+    - no training steps are wasted on no-op moves, so the engine's -50
+      no-move penalty never fires during training
+    - the replay buffer only ever contains transitions the trained policy
+      could actually take at play time, so train and test behavior match
+    """
     global steps_done
 
     # Generate a random float between 0 and 1
@@ -132,15 +140,19 @@ def select_action(state, i_episode):
     steps_done += 1
 
     if sample > epsilon:
-        # pick exploitation
+        # pick exploitation: argmax over Q-values, but only among legal
+        # actions -- illegal ones are masked to -inf so they can never win
         with torch.no_grad():  # not training
-            return policy_net(state).max(1).indices.view(1, 1)
-            # policy_net(state) -> [[10.5, 3.2, 9.6, 7.2]]
-            # max(axis=1) -> values: 10.5; indices: 0 (highest Q-value action)
+            q_values = policy_net(state).squeeze(0)
+            # q_values -> [10.5, 3.2, 9.6, 7.2]
+            masked = torch.full_like(q_values, float("-inf"))
+            masked[legal_actions] = q_values[legal_actions]
+            return masked.argmax().view(1, 1)
             # view(1, 1) -> reshape to (1, 1) -> (batch size, action)
     else:
-        # exploration
-        action = random.randrange(n_actions)
+        # exploration: uniform over legal actions only, so random moves
+        # still push the game forward instead of bouncing off walls
+        action = random.choice(legal_actions)
         return torch.tensor([[action]], device=device, dtype=torch.long)
 
 
@@ -242,29 +254,43 @@ else:
 
 
 def save_checkpoint(episode):
-    # Write to a temp file first, then atomically rename over the real
-    # checkpoint. If the process dies mid-write (crash, Ctrl+C), the temp
-    # file is left corrupted but CHECKPOINT_PATH itself is never touched
-    # until the write has fully succeeded, so it's always either fully
-    # old or fully new, never truncated/corrupted.
-    tmp_path = CHECKPOINT_PATH + ".tmp"
-    torch.save(
-        {
-            "policy_net": policy_net.state_dict(),
-            "target_net": target_net.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "steps_done": steps_done,
-            "episode_scores": episode_scores,
-            "episode": episode,
-        },
-        tmp_path,
-    )
-    os.replace(tmp_path, CHECKPOINT_PATH)
+    # Two layers of protection so a save always either completes or leaves
+    # the previous checkpoint untouched:
+    # 1. Ctrl+C is ignored for the duration of the write, so a second
+    #    impatient interrupt can't abort the save halfway through (this is
+    #    what used to leave truncated .pth files).
+    # 2. Write to a temp file first, then atomically rename over the real
+    #    checkpoint -- even on a hard kill (power loss, task manager) the
+    #    real file is either fully old or fully new, never corrupted.
+    previous_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        tmp_path = CHECKPOINT_PATH + ".tmp"
+        torch.save(
+            {
+                "policy_net": policy_net.state_dict(),
+                "target_net": target_net.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "steps_done": steps_done,
+                "episode_scores": episode_scores,
+                "episode": episode,
+            },
+            tmp_path,
+        )
+        os.replace(tmp_path, CHECKPOINT_PATH)
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
 
+
+CHECKPOINT_EVERY = 25
+"""episodes between checkpoint saves. Saving every episode put a full
+torch.save (disk I/O) inside the training loop; every N is nearly as safe
+because Ctrl+C is caught below and saves the latest state anyway -- the
+periodic save only matters for hard kills (crash, power loss)."""
 
 start_time = time.time()
 
 interrupted = False
+completed_episode = start_episode  # last fully finished episode, for Ctrl+C save
 
 try:
     for i_episode in tqdm(
@@ -273,20 +299,28 @@ try:
         total=num_episodes,
         desc="training",
     ):
-        # Initialize the environment and get its state
+        # Initialize the environment and get its state.
+        # Inputs are scaled from exponents 0..11 down to [0, 1] -- small
+        # MLPs train noticeably more stably on unit-scale inputs.
         state = env.reset()
-        state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+        state = (
+            torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+            / WIN_EXPONENT
+        )
         for t in count():  # infinite counter
-            action = select_action(state, i_episode)
+            action = select_action(state, i_episode, env.legal_actions())
             board, reward, done, score = env.step(int(action.item()))
             reward = torch.tensor([reward], device=device)
 
             if done:
                 next_state = None
             else:
-                next_state = torch.tensor(
-                    board, dtype=torch.float32, device=device
-                ).unsqueeze(0)
+                next_state = (
+                    torch.tensor(board, dtype=torch.float32, device=device).unsqueeze(
+                        0
+                    )
+                    / WIN_EXPONENT
+                )
 
             # Store the transition in memory
             memory.push(state, action, next_state, reward)
@@ -298,15 +332,15 @@ try:
             optimize_model()
 
             # Soft update of the target=teacher network's weights each step
-            # closer to policy
-            # θ′ ← τ θ + (1 − τ)θ′
-            target_net_state_dict = target_net.state_dict()
-            policy_net_state_dict = policy_net.state_dict()
-            for key in policy_net_state_dict:
-                target_net_state_dict[key] = policy_net_state_dict[
-                    key
-                ] * TAU + target_net_state_dict[key] * (1 - TAU)
-            target_net.load_state_dict(target_net_state_dict)
+            # closer to policy: θ′ ← τ θ + (1 − τ)θ′
+            # Done in-place on the parameter tensors -- rebuilding the whole
+            # state_dict each step (the tutorial version) allocates new
+            # tensors for every layer on every step
+            with torch.no_grad():
+                for target_param, param in zip(
+                    target_net.parameters(), policy_net.parameters()
+                ):
+                    target_param.mul_(1 - TAU).add_(param, alpha=TAU)
 
             if done:
                 episode_scores.append(score)
@@ -320,10 +354,23 @@ try:
                 )
                 break
 
-        save_checkpoint(i_episode + 1)
+        completed_episode = i_episode + 1
+        if completed_episode % CHECKPOINT_EVERY == 0:
+            save_checkpoint(completed_episode)
+
+    # normal completion: make sure the final episodes are checkpointed so
+    # a later run with a higher num_episodes resumes from here
+    save_checkpoint(completed_episode)
 except KeyboardInterrupt:
+    # save on Ctrl+C so stopping early never loses progress; a partial
+    # in-flight episode is discarded, resume picks up from the last
+    # completed one
     interrupted = True
-    tqdm.write(f"interrupted, checkpoint saved to {CHECKPOINT_PATH}")
+    save_checkpoint(completed_episode)
+    tqdm.write(
+        f"interrupted at episode {completed_episode}, "
+        f"checkpoint saved to {CHECKPOINT_PATH}"
+    )
 
 elapsed = time.time() - start_time
 if episode_scores:

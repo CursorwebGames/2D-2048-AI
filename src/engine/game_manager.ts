@@ -3,6 +3,17 @@ import { Tile, type Position } from "./tile.ts";
 import type { KeyboardInputManager, Direction } from "./keyboard_input_manager.ts";
 import type { HTMLActuator } from "./html_actuator.ts";
 import type { LocalStorageManager } from "./local_storage_manager.ts";
+import {
+    exponentGrid,
+    monotonicityBonus,
+    cornerBonus,
+    trappedTilePenalty,
+    buildBreakdown,
+    MERGE_BONUS_SCALE,
+    WIN_BONUS,
+    GAME_OVER_PENALTY,
+    type RewardBreakdown,
+} from "./reward.ts";
 
 export interface GameState {
     grid: GridState;
@@ -30,6 +41,9 @@ export class GameManager {
     private over = false;
     private won = false;
     private keepPlaying = false;
+    private lastReward: RewardBreakdown = { total: 0, terms: [] };
+    private history: GameState[] = [];
+    private future: GameState[] = [];
 
     constructor(
         size: number,
@@ -45,6 +59,8 @@ export class GameManager {
         this.inputManager.on("move", this.move.bind(this));
         this.inputManager.on("restart", this.restart.bind(this));
         this.inputManager.on("keepPlaying", this.continuePlaying.bind(this));
+        this.inputManager.on("undo", this.undo.bind(this));
+        this.inputManager.on("redo", this.redo.bind(this));
 
         this.setup();
     }
@@ -89,7 +105,42 @@ export class GameManager {
             this.addStartTiles();
         }
 
+        this.lastReward = { total: 0, terms: [] };
+        this.history = [];
+        this.future = [];
+
         // Update the actuator
+        this.actuate();
+    }
+
+    // Undo the last move (Backspace)
+    private undo(): void {
+        if (this.history.length === 0) return;
+
+        this.future.push(this.serialize());
+        const previous = this.history.pop()!;
+        this.loadState(previous);
+    }
+
+    // Redo a move previously undone (Enter)
+    private redo(): void {
+        if (this.future.length === 0) return;
+
+        this.history.push(this.serialize());
+        const next = this.future.pop()!;
+        this.loadState(next);
+    }
+
+    // Restore the grid/score/status from a serialized snapshot
+    private loadState(state: GameState): void {
+        this.grid = new Grid(state.grid.size, state.grid.cells);
+        this.score = state.score;
+        this.over = state.over;
+        this.won = state.won;
+        this.keepPlaying = state.keepPlaying;
+        this.lastReward = { total: 0, terms: [] };
+
+        this.actuator.continueGame(); // clear any game-over/win message
         this.actuate();
     }
 
@@ -129,6 +180,7 @@ export class GameManager {
             won: this.won,
             bestScore: this.storageManager.getBestScore(),
             terminated: this.isGameTerminated(),
+            reward: this.lastReward,
         });
     }
 
@@ -167,6 +219,22 @@ export class GameManager {
         const vector = this.getVector(direction);
         const traversals = this.buildTraversals(vector);
         let moved = false;
+        let mergeLogReward = 0;
+        const wasWonBefore = this.won;
+
+        // Potential-based shaping baseline: shape quality of the board the
+        // player acted from (post previous spawn). The move's shape reward
+        // is the CHANGE it causes, so mess that predates this move cancels
+        // out. Mirrors ai/engine.py step().
+        const exponentsBefore = exponentGrid(this.grid);
+        const monotonicityBefore = monotonicityBonus(exponentsBefore);
+        const cornerBefore = cornerBonus(exponentsBefore);
+        const trappedBefore = trappedTilePenalty(exponentsBefore);
+
+        // Save undo history; popped back off below if this move turns out
+        // to be a no-op, and any redo stack is invalidated by a real move
+        this.history.push(this.serialize());
+        this.future = [];
 
         // Save the current tile positions and remove merger information
         this.prepareTiles();
@@ -195,6 +263,9 @@ export class GameManager {
                         // Update the score
                         this.score += merged.value;
 
+                        // Track reward info (log-scale merge reward, like ai/engine.py)
+                        mergeLogReward += Math.log2(merged.value);
+
                         // The mighty 2048 tile
                         if (merged.value === 2048) this.won = true;
                     } else {
@@ -209,13 +280,46 @@ export class GameManager {
         });
 
         if (moved) {
+            // Shape rewards are the DELTA each heuristic saw across the
+            // move (potential-based shaping), computed before the random
+            // tile spawn so the spawn's effect is never credited/blamed on
+            // this move -- it lands in the next move's baseline instead.
+            // The deltas are shown per-component so the readout explains
+            // exactly what the move improved or broke.
+            const exponents = exponentGrid(this.grid);
+            const justWon = !wasWonBefore && this.won;
+            const terms = [
+                { label: "merge", value: mergeLogReward },
+                { label: "merge bonus", value: mergeLogReward * MERGE_BONUS_SCALE },
+                {
+                    label: "monotonicity Δ",
+                    value: monotonicityBonus(exponents) - monotonicityBefore,
+                },
+                { label: "corner Δ", value: cornerBonus(exponents) - cornerBefore },
+                {
+                    label: "trapped Δ",
+                    value: trappedTilePenalty(exponents) - trappedBefore,
+                },
+                { label: "win", value: justWon ? WIN_BONUS : 0 },
+            ];
+
             this.addRandomTile();
 
             if (!this.movesAvailable()) {
                 this.over = true; // Game over!
+                terms.push({ label: "game over", value: GAME_OVER_PENALTY });
             }
 
+            this.lastReward = buildBreakdown(terms);
             this.actuate();
+        } else {
+            // No-op move: nothing changed, so drop the history entry we
+            // speculatively pushed above. No penalty -- the RL side masks
+            // illegal actions instead of punishing them, so the engines
+            // agree that a no-op is simply worth 0.
+            this.history.pop();
+            this.lastReward = buildBreakdown([]);
+            this.actuator.updateReward(this.lastReward);
         }
     }
 

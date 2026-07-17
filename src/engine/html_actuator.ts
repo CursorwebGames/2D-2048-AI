@@ -1,5 +1,8 @@
 import type { Grid } from "./grid.ts";
 import type { Tile, Position } from "./tile.ts";
+import type { RewardBreakdown } from "./reward.ts";
+
+const SHOW_REWARD = true;
 
 export interface ActuateMetadata {
     score: number;
@@ -7,6 +10,7 @@ export interface ActuateMetadata {
     won: boolean;
     bestScore: number;
     terminated: boolean;
+    reward: RewardBreakdown;
 }
 
 export class HTMLActuator {
@@ -14,8 +18,14 @@ export class HTMLActuator {
     private scoreContainer = document.querySelector(".score-container")!;
     private bestContainer = document.querySelector(".best-container")!;
     private messageContainer = document.querySelector(".game-message")!;
+    private rewardContainer = document.querySelector(".reward")!;
 
     private score = 0;
+    private lastReward: RewardBreakdown = { total: 0, terms: [] };
+
+    constructor() {
+        this.renderReward();
+    }
 
     actuate(grid: Grid, metadata: ActuateMetadata): void {
         window.requestAnimationFrame(() => {
@@ -31,6 +41,7 @@ export class HTMLActuator {
 
             this.updateScore(metadata.score);
             this.updateBestScore(metadata.bestScore);
+            this.updateReward(metadata.reward);
 
             if (metadata.terminated) {
                 if (metadata.over) {
@@ -40,6 +51,27 @@ export class HTMLActuator {
                 }
             }
         });
+    }
+
+    // Updates and (if enabled) displays the RL reward breakdown for the last move
+    updateReward(reward: RewardBreakdown): void {
+        this.lastReward = reward;
+        this.renderReward();
+    }
+
+    private renderReward(): void {
+        if (!SHOW_REWARD) {
+            this.rewardContainer.textContent = "";
+            return;
+        }
+
+        const breakdown = this.lastReward.terms
+            .map((term) => `${term.label}: ${term.value > 0 ? "+" : ""}${term.value}`)
+            .join(", ");
+
+        this.rewardContainer.textContent = breakdown
+            ? `Reward: ${this.lastReward.total} (${breakdown})`
+            : `Reward: ${this.lastReward.total}`;
     }
 
     // Continues the game (both restart and keep playing)
