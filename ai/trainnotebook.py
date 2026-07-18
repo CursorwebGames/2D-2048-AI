@@ -142,9 +142,39 @@ without exploration noise (see eval_policy)."""
 start_episode = 0
 
 CHECKPOINT_PATH = "checkpoint_2048.pth"
-# Notebook edition always trains fresh -- no resume-from-checkpoint. The
-# kernel holds all state for the session; checkpoints are only written at
-# the end (or on interrupt) so the result can be played back in test.py.
+# Resume from a checkpoint if one exists, so re-running this cell (or a
+# fresh kernel) continues training an existing model instead of starting
+# over. The replay buffer isn't saved, so it's rebuilt below via
+# warm_fill_buffer before any optimizer steps run.
+if os.path.exists(CHECKPOINT_PATH):
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
+    try:
+        policy_net.load_state_dict(checkpoint["policy_net"])
+    except RuntimeError as e:
+        raise SystemExit(
+            f"{CHECKPOINT_PATH} was trained with a different network "
+            "architecture (input size or hidden width changed since it "
+            "was saved). Delete or rename it to start fresh."
+        ) from e
+    target_net.load_state_dict(checkpoint["target_net"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    steps_done = checkpoint["steps_done"]
+    episode_scores = checkpoint["episode_scores"]
+    eval_history = checkpoint.get("eval_history", [])
+    start_episode = checkpoint["episode"]
+
+    # Extend the run by one more full episode budget past the checkpoint,
+    # and re-derive EPS_DECAY from the new total -- otherwise epsilon would
+    # still be evaluated against the ORIGINAL num_episodes, which by this
+    # point has almost fully decayed to EPS_END (near-zero exploration).
+    # Recomputing it re-opens a bit of exploration for the extended run
+    # instead of continuing in a purely exploitative rut.
+    num_episodes = start_episode + num_episodes
+    EPS_DECAY = num_episodes / 5
+    print(
+        f"resumed from {CHECKPOINT_PATH} at episode {start_episode}, "
+        f"training to {num_episodes} (EPS_DECAY={EPS_DECAY:.0f})"
+    )
 
 # %% Action selection, warm-fill, eval, plotting
 
@@ -173,6 +203,45 @@ def select_action(state, i_episode, legal_actions):
         # exploration: uniform over legal actions only
         action = random.choice(legal_actions)
         return torch.tensor([[action]], device=device, dtype=torch.long)
+
+
+WARM_FILL_TRANSITIONS = 5_000
+"""Replay-buffer size to reach before training resumes after a checkpoint
+load. The buffer isn't saved in checkpoints, so a resumed run starts with
+an empty one; without this, the first optimizer steps would train on a
+handful of highly correlated recent episodes."""
+
+
+def warm_fill_buffer(i_episode: int):
+    fill_env = Engine()
+    fill_start = time.time()
+    while len(memory) < WARM_FILL_TRANSITIONS:
+        fill_state = (
+            torch.tensor(
+                fill_env.reset(), dtype=torch.float32, device=device
+            ).unsqueeze(0)
+            / WIN_EXPONENT
+        )
+        while not fill_env.done:
+            # same epsilon-greedy behavior policy as training, so the
+            # collected transitions match the distribution training sees
+            action = select_action(fill_state, i_episode, fill_env.legal_actions())
+            board, reward, done, _ = fill_env.step(int(action.item()))
+            reward_t = torch.tensor([reward / REWARD_SCALE], device=device)
+            next_state = (
+                None
+                if done
+                else torch.tensor(
+                    board, dtype=torch.float32, device=device
+                ).unsqueeze(0)
+                / WIN_EXPONENT
+            )
+            memory.push(fill_state, action, next_state, reward_t)
+            fill_state = next_state
+    print(
+        f"warm-filled replay buffer with {len(memory)} transitions "
+        f"in {time.time() - fill_start:.1f}s"
+    )
 
 
 EVAL_EVERY = 50
@@ -315,6 +384,12 @@ def save_checkpoint(episode):
 # nets, replay buffer, and episode counters alive, re-running this cell
 # simply continues training in place -- no resume machinery needed.
 
+# A resumed run starts with an empty buffer; refill it with the current
+# policy before any optimizer steps. Fresh runs skip this -- they build
+# the buffer naturally during high-epsilon early episodes.
+if start_episode > 0 and len(memory) == 0:
+    warm_fill_buffer(start_episode)
+
 start_time = time.time()
 
 interrupted = False
@@ -376,6 +451,7 @@ try:
                 recent = episode_scores[-25:]
                 pbar.set_postfix(
                     score=score,
+                    steps=steps_done,
                     avg25=round(sum(recent) / len(recent)),
                     eps=round(epsilon, 2),
                 )
@@ -390,7 +466,7 @@ try:
             eval_history.append((completed_episode, eval_mean))
             tqdm.write(
                 f"  eval @ episode {completed_episode}: "
-                f"mean greedy score={eval_mean:.0f} over {EVAL_EPISODES} games"
+                f"mean score={eval_mean:.0f} over {EVAL_EPISODES} games"
             )
 
     # normal completion: checkpoint the final episodes so a later run with
