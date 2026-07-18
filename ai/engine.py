@@ -1,3 +1,5 @@
+# For reference
+# dqn=2286.4  greedy=6920.8  random=1416.0
 import random
 from enum import IntEnum
 from functools import lru_cache
@@ -53,7 +55,10 @@ def monotonicity_bonus(board: np.ndarray) -> int:
     )
     if penalty == 0:
         return MONOTONICITY_PERFECT_BONUS
-    return -(penalty // 2)
+    # // 4 (was // 2): keeps monotonicity a tiebreaker, not a veto -- at
+    # // 2 the agent would pass up real merges to avoid small shape hits,
+    # and merges are what actually score points and clear board space
+    return -(penalty // 4)
 
 
 CORNER_WEIGHT = 2
@@ -98,11 +103,7 @@ def board_potential(board: np.ndarray) -> int:
     """Phi(s): a standalone measure of board quality, used for
     potential-based reward shaping (see step()). Higher = better-organized
     board. Composed of the three shape heuristics."""
-    return (
-        monotonicity_bonus(board)
-        + corner_bonus(board)
-        + trapped_tile_penalty(board)
-    )
+    return monotonicity_bonus(board) + corner_bonus(board) + trapped_tile_penalty(board)
 
 
 @lru_cache(maxsize=None)

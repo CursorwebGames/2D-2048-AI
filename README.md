@@ -37,8 +37,13 @@ reward = merge_reward + Φ(after) − Φ(before)   [+ win/game-over bonuses]
   credited/blamed on the move that preceded it.
 * Illegal moves are never punished — training and play both mask them out
   (`select_action` in ai/train.py and ai/test.py).
-* Network inputs are tile exponents scaled to [0, 1] (divided by
-  `WIN_EXPONENT` = 11).
+* Network inputs are the 16 tile exponents scaled to [0, 1] (divided by
+  `WIN_EXPONENT` = 11). A one-hot encoding (16 cells x 16 classes) was
+  tried and performed worse at the ~1000-episode training budget: one-hot
+  removes the free numeric generalization scalar inputs give (lessons
+  about 32-tiles partially transfer to 64-tiles), and learning every
+  (cell, value) pair independently needs far more episodes. Revisit only
+  with 10k+ episode runs.
 
 ## Credit
 Forked from the [🐐 GOAT](https://github.com/gabrielecirulli/2048/tree/master)

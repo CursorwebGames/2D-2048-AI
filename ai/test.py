@@ -17,7 +17,7 @@ from random_agent import benchmark, print_stats
 CHECKPOINT_PATH = "checkpoint_2048.pth"
 
 n_actions = 4
-n_observations = 16
+n_observations = 16  # 4x4 board of exponents, scaled to [0, 1]
 
 # ANSI background colors per tile exponent (1=2, 2=4, ... 11=2048, ...)
 TILE_COLORS = {
@@ -68,12 +68,15 @@ def render_board(board, action: "Action | None" = None) -> str:
     return "\n".join(lines)
 
 
+HIDDEN_SIZE = 128  # must match train.py or checkpoints won't load
+
+
 class DQN(nn.Module):
     def __init__(self, n_observations: int, n_actions: int):
         super().__init__()
-        self.layer1 = nn.Linear(n_observations, 128)
-        self.layer2 = nn.Linear(128, 128)
-        self.layer3 = nn.Linear(128, n_actions)
+        self.layer1 = nn.Linear(n_observations, HIDDEN_SIZE)
+        self.layer2 = nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE)
+        self.layer3 = nn.Linear(HIDDEN_SIZE, n_actions)
 
     def forward(self, x):
         x = F.relu(self.layer1(x))
@@ -118,8 +121,8 @@ def select_action(policy_net, state, legal_actions):
 def dqn_play_episode(policy_net, env: Engine, device) -> int:
     env.reset()
     while not env.done:
-        # same [0, 1] input scaling as training (train.py divides by
-        # WIN_EXPONENT) -- the net only ever saw scaled inputs
+        # same [0, 1] input scaling as training -- the net only ever saw
+        # scaled inputs
         state = (
             torch.tensor(
                 env.board.flatten(), dtype=torch.float32, device=device
@@ -145,23 +148,36 @@ def greedy_play_episode(env: Engine) -> int:
     return env.score
 
 
+def run_baseline(num_episodes: int):
+    """Greedy vs random comparison -- no checkpoint needed, so it can run
+    before any training exists. Greedy meaningfully beating random is the
+    sanity check that the shaped reward encodes real 2048 strategy."""
+    env = Engine()
+    greedy_scores = [greedy_play_episode(env) for _ in range(num_episodes)]
+    random_scores = benchmark(num_episodes)
+
+    print_stats(greedy_scores, label="greedy")
+    print_stats(random_scores, label="random")
+
+    greedy_mean = sum(greedy_scores) / len(greedy_scores)
+    random_mean = sum(random_scores) / len(random_scores)
+    ratio = greedy_mean / random_mean if random_mean else float("inf")
+    print(f"\ngreedy={greedy_mean:.1f}  random={random_mean:.1f}  ({ratio:.2f}x)")
+    return greedy_mean, random_mean
+
+
 def run_benchmark(policy_net, device, num_episodes: int):
     env = Engine()
     dqn_scores = [
         dqn_play_episode(policy_net, env, device) for _ in range(num_episodes)
     ]
-    greedy_scores = [greedy_play_episode(env) for _ in range(num_episodes)]
-    random_scores = benchmark(num_episodes)
-
     print_stats(dqn_scores, label="dqn")
-    print_stats(greedy_scores, label="greedy")
-    print_stats(random_scores, label="random")
+
+    greedy_mean, random_mean = run_baseline(num_episodes)
 
     dqn_mean = sum(dqn_scores) / len(dqn_scores)
-    greedy_mean = sum(greedy_scores) / len(greedy_scores)
-    random_mean = sum(random_scores) / len(random_scores)
     print(
-        f"\ndqn={dqn_mean:.1f}  greedy={greedy_mean:.1f}  random={random_mean:.1f}"
+        f"dqn={dqn_mean:.1f}  greedy={greedy_mean:.1f}  random={random_mean:.1f}"
     )
     if dqn_mean > greedy_mean:
         print("dqn beats greedy: the net has learned lookahead beyond the reward function")
@@ -231,10 +247,21 @@ def main():
         metavar="N",
         help="run N random-agent episodes and report reward/score stats (no checkpoint needed)",
     )
+    parser.add_argument(
+        "--baseline",
+        type=int,
+        default=0,
+        metavar="N",
+        help="run N episodes of greedy (best immediate shaped reward) vs random (no checkpoint needed)",
+    )
     args = parser.parse_args()
 
     if args.reward_check:
         reward_sanity_check(args.reward_check)
+        return
+
+    if args.baseline:
+        run_baseline(args.baseline)
         return
 
     device = torch.device("cpu")

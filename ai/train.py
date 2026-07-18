@@ -47,12 +47,22 @@ class ReplayMemory(object):
         return len(self.memory)
 
 
+HIDDEN_SIZE = 128
+"""Hidden layer width. 128 with scalar inputs is the config that showed a
+real climbing eval curve. (A one-hot/256-wide variant was tried and was
+WORSE at the ~1000-episode budget: one-hot removes the free numeric
+generalization scalar inputs give -- lessons about 32-tiles partially
+transfer to 64-tiles because they're adjacent on the input axis -- and
+learning every (cell, value) pair independently needs far more episodes
+than this project's budget. Revisit only with 10k+ episode runs.)"""
+
+
 class DQN(nn.Module):
     def __init__(self, n_observations: int, n_actions: int):
         super(DQN, self).__init__()
-        self.layer1 = nn.Linear(n_observations, 128)
-        self.layer2 = nn.Linear(128, 128)
-        self.layer3 = nn.Linear(128, n_actions)
+        self.layer1 = nn.Linear(n_observations, HIDDEN_SIZE)
+        self.layer2 = nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE)
+        self.layer3 = nn.Linear(HIDDEN_SIZE, n_actions)
 
     def forward(self, x):
         x = F.relu(self.layer1(x))  # relu nonlinear function
@@ -87,7 +97,7 @@ LR = 3e-4
 """ Learning rate (how much neural network changes weights after each step) """
 
 n_actions = 4  # up right down left
-n_observations = 16  # 4x4
+n_observations = 16  # 4x4 board of exponents, scaled to [0, 1]
 
 env = Engine()
 state = env.reset()
@@ -100,21 +110,57 @@ target_net.load_state_dict(policy_net.state_dict())
 
 
 optimizer = optim.AdamW(policy_net.parameters(), lr=LR, amsgrad=True)
-memory = ReplayMemory(10_000)
+# 100k transitions ~ several hundred episodes of history. At 10k the buffer
+# only held ~50 recent (highly correlated) episodes, so the net kept
+# training on near-identical late-game states from its current policy.
+memory = ReplayMemory(100_000)
+
+REWARD_SCALE = 100.0
+"""Rewards are divided by this before entering the Bellman update. Shaped
+rewards hit +/-40 per step and +/-200 at win/lose, so Q-targets accumulate
+into the hundreds -- far outside SmoothL1Loss's quadratic zone (|error|<1),
+where gradients stop scaling with error size and learning crawls.
+Normalizing keeps Q-values O(1-10). Only the training tensor is scaled;
+the engine and its readouts stay human-scale.
+
+Optimal range for the Bellman targets (Q-values): roughly [-10, +10],
+ideally centered near 0 with typical magnitudes of O(1).
+  - per-step rewards should land around |r| <= 1 so a single-step TD error
+    is inside the Huber quadratic zone (|error| < 1), where gradient
+    magnitude is proportional to error size
+  - the discounted return sum r + gamma*r' + ... (gamma=0.99, episodes of
+    ~150-300 steps) then tops out around +/-10, which a 128-wide MLP with
+    unit-scale [0,1] inputs can represent without huge output-layer weights
+  - much larger (100s+): Huber goes linear, gradients stop discriminating
+    big vs small errors; much smaller (<<0.1): TD errors drown in float
+    noise and learning also slows.
+With our reward stats (typical step +/-5-40, terminal +/-200), dividing by
+100 puts steps at ~0.05-0.4 and returns at ~2-8: inside the sweet spot."""
 
 steps_done = 0
 episode_scores = []
+eval_history = []
+"""(episode, mean greedy score) pairs -- the true learning curve, measured
+without exploration noise (see eval_policy)."""
 start_episode = 0
 
 CHECKPOINT_PATH = "checkpoint_2048.pth"
 
 if os.path.exists(CHECKPOINT_PATH):
     checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
-    policy_net.load_state_dict(checkpoint["policy_net"])
+    try:
+        policy_net.load_state_dict(checkpoint["policy_net"])
+    except RuntimeError as e:
+        raise SystemExit(
+            f"{CHECKPOINT_PATH} was trained with a different network "
+            "architecture (input size or hidden width changed since it "
+            "was saved). Delete or rename it to start fresh."
+        ) from e
     target_net.load_state_dict(checkpoint["target_net"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     steps_done = checkpoint["steps_done"]
     episode_scores = checkpoint["episode_scores"]
+    eval_history = checkpoint.get("eval_history", [])
     start_episode = checkpoint["episode"]
     print(f"resumed from {CHECKPOINT_PATH} at episode {start_episode}")
 
@@ -156,6 +202,77 @@ def select_action(state, i_episode, legal_actions):
         return torch.tensor([[action]], device=device, dtype=torch.long)
 
 
+WARM_FILL_TRANSITIONS = 5_000
+"""Replay-buffer size to reach before training resumes after a checkpoint
+load. The buffer isn't saved in checkpoints, so a resumed run starts with
+an empty one; without this, the first ~30-50 episodes would optimize on a
+handful of highly correlated recent episodes. Collecting experience with
+the current policy (no optimizer steps, no backprop) is cheap and gives
+the first real update a properly diverse sample."""
+
+
+def warm_fill_buffer(i_episode: int):
+    fill_env = Engine()
+    fill_start = time.time()
+    while len(memory) < WARM_FILL_TRANSITIONS:
+        fill_state = (
+            torch.tensor(
+                fill_env.reset(), dtype=torch.float32, device=device
+            ).unsqueeze(0)
+            / WIN_EXPONENT
+        )
+        while not fill_env.done:
+            # same epsilon-greedy behavior policy as training, so the
+            # collected transitions match the distribution training sees
+            action = select_action(fill_state, i_episode, fill_env.legal_actions())
+            board, reward, done, _ = fill_env.step(int(action.item()))
+            reward_t = torch.tensor([reward / REWARD_SCALE], device=device)
+            next_state = (
+                None
+                if done
+                else torch.tensor(board, dtype=torch.float32, device=device).unsqueeze(
+                    0
+                )
+                / WIN_EXPONENT
+            )
+            memory.push(fill_state, action, next_state, reward_t)
+            fill_state = next_state
+    print(
+        f"warm-filled replay buffer with {len(memory)} transitions "
+        f"in {time.time() - fill_start:.1f}s"
+    )
+
+
+EVAL_EVERY = 50
+EVAL_EPISODES = 5
+
+
+def eval_policy() -> float:
+    """Plays EVAL_EPISODES games greedily (epsilon=0, legal-masked argmax,
+    same as test.py) and returns the mean score. This is the real measure
+    of the learned weights -- training-episode scores are polluted by
+    exploration randomness."""
+    eval_env = Engine()
+    scores = []
+    for _ in range(EVAL_EPISODES):
+        eval_env.reset()
+        while not eval_env.done:
+            eval_state = (
+                torch.tensor(
+                    eval_env.board.flatten(), dtype=torch.float32, device=device
+                ).unsqueeze(0)
+                / WIN_EXPONENT
+            )
+            legal = eval_env.legal_actions()
+            with torch.no_grad():
+                q_values = policy_net(eval_state).squeeze(0)
+                masked = torch.full_like(q_values, float("-inf"))
+                masked[legal] = q_values[legal]
+            eval_env.step(int(masked.argmax().item()))
+        scores.append(eval_env.score)
+    return sum(scores) / len(scores)
+
+
 def plot_scores(show_result=False):
     plt.clf()
 
@@ -168,14 +285,22 @@ def plot_scores(show_result=False):
     plt.ylabel("Score")
 
     scores = torch.tensor(episode_scores, dtype=torch.float)
-    plt.plot(scores.numpy())
+    plt.plot(scores.numpy(), label="training (with exploration)")
 
     # Plot 100-episode moving average
     if len(scores) >= 100:
         avg = scores.unfold(0, 100, 1).mean(1)
         avg = torch.cat((torch.zeros(99), avg))
-        plt.plot(avg.numpy())
+        plt.plot(avg.numpy(), label="100-ep moving avg")
 
+    # The true learning curve: greedy-policy evals, no exploration noise.
+    # Training scores understate the policy (epsilon-random moves can ruin
+    # a game); this line answers "is it actually getting better".
+    if eval_history:
+        eval_x, eval_y = zip(*eval_history)
+        plt.plot(eval_x, eval_y, marker="o", label="eval (greedy policy)")
+
+    plt.legend()
     plt.pause(0.001)
 
 
@@ -272,6 +397,7 @@ def save_checkpoint(episode):
                 "optimizer": optimizer.state_dict(),
                 "steps_done": steps_done,
                 "episode_scores": episode_scores,
+                "eval_history": eval_history,
                 "episode": episode,
             },
             tmp_path,
@@ -287,6 +413,12 @@ torch.save (disk I/O) inside the training loop; every N is nearly as safe
 because Ctrl+C is caught below and saves the latest state anyway -- the
 periodic save only matters for hard kills (crash, power loss)."""
 
+# A resumed run starts with an empty buffer; refill it with the current
+# policy before any optimizer steps. Fresh runs skip this -- they build
+# the buffer naturally during high-epsilon early episodes.
+if start_episode > 0:
+    warm_fill_buffer(start_episode)
+
 start_time = time.time()
 
 interrupted = False
@@ -299,26 +431,25 @@ try:
         total=num_episodes,
         desc="training",
     ):
-        # Initialize the environment and get its state.
-        # Inputs are scaled from exponents 0..11 down to [0, 1] -- small
-        # MLPs train noticeably more stably on unit-scale inputs.
-        state = env.reset()
+        # Initialize the environment and get its state, exponents scaled
+        # to [0, 1] -- small MLPs train more stably on unit-scale inputs
         state = (
-            torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+            torch.tensor(env.reset(), dtype=torch.float32, device=device).unsqueeze(0)
             / WIN_EXPONENT
         )
         for t in count():  # infinite counter
             action = select_action(state, i_episode, env.legal_actions())
             board, reward, done, score = env.step(int(action.item()))
-            reward = torch.tensor([reward], device=device)
+            # normalized so Q-targets stay in SmoothL1Loss's quadratic zone
+            reward = torch.tensor([reward / REWARD_SCALE], device=device)
 
             if done:
                 next_state = None
             else:
                 next_state = (
-                    torch.tensor(board, dtype=torch.float32, device=device).unsqueeze(
-                        0
-                    )
+                    torch.tensor(
+                        board, dtype=torch.float32, device=device
+                    ).unsqueeze(0)
                     / WIN_EXPONENT
                 )
 
@@ -355,6 +486,16 @@ try:
                 break
 
         completed_episode = i_episode + 1
+
+        # Periodic greedy-policy evaluation: the real learning curve
+        if completed_episode % EVAL_EVERY == 0:
+            eval_mean = eval_policy()
+            eval_history.append((completed_episode, eval_mean))
+            tqdm.write(
+                f"  eval @ episode {completed_episode}: "
+                f"mean greedy score={eval_mean:.0f} over {EVAL_EPISODES} games"
+            )
+
         if completed_episode % CHECKPOINT_EVERY == 0:
             save_checkpoint(completed_episode)
 

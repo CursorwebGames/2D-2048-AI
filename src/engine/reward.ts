@@ -79,7 +79,10 @@ export function monotonicityBonus(exponents: number[][]): number {
         penalty += lineMonotonicityPenalty(exponents.map((row) => row[y]));
     }
 
-    return penalty === 0 ? MONOTONICITY_PERFECT_BONUS : -Math.floor(penalty / 2);
+    // / 4 (was / 2): keeps monotonicity a tiebreaker, not a veto -- at / 2
+    // the agent would pass up real merges to avoid small shape hits, and
+    // merges are what actually score points and clear board space
+    return penalty === 0 ? MONOTONICITY_PERFECT_BONUS : -Math.floor(penalty / 4);
 }
 
 // Reward when the highest tile sits in a corner, penalty when it doesn't,
